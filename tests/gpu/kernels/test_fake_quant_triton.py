@@ -6,16 +6,17 @@
 - ``fake_quant`` routes CUDA / contiguous / last-axis / mxfp8 through it and everything else to eager,
 - ``HALO_LOWP_TRITON=0`` disables it, and the straight-through backward is unchanged.
 
-Run: python tests/gpu/kernels/test_fake_quant_triton.py
+Run: torchrun --nproc_per_node=1 tests/gpu/kernels/test_fake_quant_triton.py
 """
 
 import os
-import sys
 
 import torch
 
-import src.kernels.lowp.fake_quant_triton as fqt
+import src.kernels.lowp.quantization as q
+from src.kernels.lowp.fake_quant_triton import fake_quant_mxfp8_triton
 from src.kernels.lowp.quantization import _block_round_trip, fake_quant
+from tests.common.harness import gpu_test_main, record_check
 
 DEV = "cuda"
 K = 2880
@@ -32,12 +33,19 @@ def _cases():
     yield "negzero", torch.full((64, K), -0.0, device=DEV, dtype=bf)
     yield "tiny", torch.full((64, K), 1e-40, device=DEV, dtype=bf)
     yield "huge", torch.full((64, K), 3e38, device=DEV, dtype=bf)
-    t = torch.randn(64, K, device=DEV, dtype=bf); t[3, 5] = float("nan"); yield "nan", t
-    t = torch.randn(64, K, device=DEV, dtype=bf); t[0, 0] = float("inf"); yield "inf", t
+    t = torch.randn(64, K, device=DEV, dtype=bf)
+    t[3, 5] = float("nan")
+    yield "nan", t
+    t = torch.randn(64, K, device=DEV, dtype=bf)
+    t[0, 0] = float("inf")
+    yield "inf", t
     yield "midpoints", torch.randn(64, K, device=DEV, dtype=bf) * 1.0625
     t = torch.full((64, K), 448.0 * 2.0**5, device=DEV)
     yield "fp32_ulp_edge", torch.nextafter(t, torch.full_like(t, 1e30))
     yield "near_denorm", torch.full((64, K), 3e-36, device=DEV, dtype=bf)
+    yield "empty", torch.empty(0, K, device=DEV, dtype=bf)
+    yield "fp16", torch.randn(64, K, device=DEV, dtype=torch.float16)
+    yield "fp32", torch.randn(64, K, device=DEV, dtype=torch.float32)
 
 
 def _assert_bits_equal(out, ref, name):
@@ -51,18 +59,18 @@ class _Spy:
 
     def __init__(self):
         self.calls = 0
-        self._orig = fqt.fake_quant_mxfp8_triton
+        self._orig = q.fake_quant_mxfp8_triton
 
     def __enter__(self):
         def spy(t, *a, **k):
             self.calls += 1
             return self._orig(t, *a, **k)
 
-        fqt.fake_quant_mxfp8_triton = spy
+        q.fake_quant_mxfp8_triton = spy
         return self
 
     def __exit__(self, *_):
-        fqt.fake_quant_mxfp8_triton = self._orig
+        q.fake_quant_mxfp8_triton = self._orig
 
 
 def test_bit_exact_against_eager():
@@ -70,7 +78,7 @@ def test_bit_exact_against_eager():
     n = 0
     for name, t in _cases():
         ref = _block_round_trip(t, "mxfp8", -1).to(t.dtype)
-        _assert_bits_equal(fqt.fake_quant_mxfp8_triton(t), ref, name)
+        _assert_bits_equal(fake_quant_mxfp8_triton(t), ref, name)
         n += 1
     print(f"  {n} cases bit-exact — OK")
 
@@ -81,10 +89,10 @@ def test_routing():
     with _Spy() as s:
         _assert_bits_equal(fake_quant(t, "mxfp8"), _block_round_trip(t, "mxfp8", -1), "wired")
         assert s.calls == 1, "fast path not taken for the canonical case"
-        fake_quant(t, "mxfp8", axis=0)                      # non-last axis → eager
-        fake_quant(t, "mxfp4")                              # other format → eager
-        fake_quant(t.t().contiguous().t(), "mxfp8")         # non-contiguous → eager
-        fake_quant(t.cpu(), "mxfp8")                        # CPU → eager
+        fake_quant(t, "mxfp8", axis=0)  # non-last axis → eager
+        fake_quant(t, "mxfp4")  # other format → eager
+        fake_quant(t.t().contiguous().t(), "mxfp8")  # non-contiguous → eager
+        fake_quant(t.cpu(), "mxfp8")  # CPU → eager
         assert s.calls == 1, f"fallback cases took the fast path ({s.calls - 1} extra calls)"
     try:
         fake_quant(torch.randn(8, 33, device=DEV, dtype=torch.bfloat16), "mxfp8")
@@ -117,11 +125,15 @@ def test_ste_backward():
     print("  STE backward — OK")
 
 
+@gpu_test_main(exact_world_size=1, prefix="fake_quant_triton", partial_state=False)
+def run(ctx) -> dict:
+    checks: dict[str, bool] = {}
+    record_check(checks, "bit_exact_against_eager", test_bit_exact_against_eager)
+    record_check(checks, "routing", test_routing)
+    record_check(checks, "kill_switch", test_kill_switch)
+    record_check(checks, "ste_backward", test_ste_backward)
+    return {"checks": checks}
+
+
 if __name__ == "__main__":
-    if not torch.cuda.is_available():
-        print("SKIP: no CUDA")
-        sys.exit(0)
-    for fn in (test_bit_exact_against_eager, test_routing, test_kill_switch, test_ste_backward):
-        print(fn.__name__)
-        fn()
-    print("ALL PASS")
+    run()
