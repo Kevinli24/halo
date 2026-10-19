@@ -220,6 +220,7 @@ MANIFEST: dict[str, TestSpec] = {
     "kernels/test_liger_routed_experts.py": TestSpec(
         nproc=1, markers=("gpu", "core", "1gpu", "moe", "qwen3"), timeout=600
     ),
+    "kernels/test_fake_quant_triton.py": TestSpec(nproc=1, markers=("gpu", "core", "1gpu"), timeout=600),
     "kernels/test_lowp_expert_lora.py": TestSpec(nproc=1, markers=("gpu", "core", "1gpu", "lora", "moe"), timeout=600),
     "kernels/test_packed_broadcast_memory.py": TestSpec(nproc=1, markers=("gpu", "core", "1gpu"), timeout=600),
     "kernels/test_lowp_fsdp2_weight_cache.py": TestSpec(nproc=2, markers=("gpu", "core", "2gpu"), timeout=600),
