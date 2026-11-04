@@ -16,11 +16,7 @@ import torch
 from torch._dynamo.exc import TorchDynamoException
 
 from src.env import env_flag
-
-try:
-    from src.kernels.lowp.fake_quant_triton import fake_quant_mxfp8_triton
-except ImportError:  # triton unavailable (CPU-only install): eager path only
-    fake_quant_mxfp8_triton = None
+from src.kernels.lowp.fake_quant_triton import fake_quant_mxfp8_triton
 
 logger = logging.getLogger(__name__)
 
@@ -275,14 +271,12 @@ class _FakeQuant(torch.autograd.Function):
     def forward(ctx, t: torch.Tensor, fmt: str, axis: int) -> torch.Tensor:
         if (
             fmt == "mxfp8"
-            and fake_quant_mxfp8_triton is not None
             and t.is_cuda
             and t.is_contiguous()
             and axis in (-1, t.ndim - 1)
-            and t.shape[-1] % 32 == 0
-            and env_flag("HALO_LOWP_TRITON", True)
+            and t.shape[-1] % FORMAT_BLOCK_SIZE[fmt] == 0
         ):
-            return fake_quant_mxfp8_triton(t)
+            return fake_quant_mxfp8_triton(t, FORMAT_BLOCK_SIZE[fmt])
         # Eager: activation path (and dense weights); shapes vary, so compiling recompiles constantly.
         return _block_round_trip(t, fmt, axis).to(t.dtype)
 

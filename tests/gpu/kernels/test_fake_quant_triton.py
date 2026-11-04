@@ -4,18 +4,16 @@
   powers of two, the 448 scale boundary, zeros, -0.0, subnormals, overflow, NaN, inf, e4m3 rounding
   midpoints, an fp32 one-ulp scale edge, and a near-subnormal scale,
 - ``fake_quant`` routes CUDA / contiguous / last-axis / mxfp8 through it and everything else to eager,
-- ``HALO_LOWP_TRITON=0`` disables it, and the straight-through backward is unchanged.
+- the straight-through backward is unchanged.
 
 Run: torchrun --nproc_per_node=1 tests/gpu/kernels/test_fake_quant_triton.py
 """
-
-import os
 
 import torch
 
 import src.kernels.lowp.quantization as q
 from src.kernels.lowp.fake_quant_triton import fake_quant_mxfp8_triton
-from src.kernels.lowp.quantization import _block_round_trip, fake_quant
+from src.kernels.lowp.quantization import FORMAT_BLOCK_SIZE, _block_round_trip, fake_quant
 from tests.common.harness import gpu_test_main, record_check
 
 DEV = "cuda"
@@ -54,8 +52,8 @@ def _assert_bits_equal(out, ref, name):
 
 
 class _Spy:
-    """Counts fast-path calls. ``quantization.py`` imports the kernel lazily at call time, so
-    patching the module attribute is enough."""
+    """Counts fast-path calls. ``_FakeQuant`` resolves the kernel as a ``quantization`` module global at
+    call time, so patching the module attribute is enough."""
 
     def __init__(self):
         self.calls = 0
@@ -78,7 +76,7 @@ def test_bit_exact_against_eager():
     n = 0
     for name, t in _cases():
         ref = _block_round_trip(t, "mxfp8", -1).to(t.dtype)
-        _assert_bits_equal(fake_quant_mxfp8_triton(t), ref, name)
+        _assert_bits_equal(fake_quant_mxfp8_triton(t, FORMAT_BLOCK_SIZE["mxfp8"]), ref, name)
         n += 1
     print(f"  {n} cases bit-exact — OK")
 
@@ -102,20 +100,6 @@ def test_routing():
     print("  routing and fallbacks — OK")
 
 
-def test_kill_switch():
-    """HALO_LOWP_TRITON=0 forces the eager path; result is unchanged."""
-    t = torch.randn(64, K, device=DEV, dtype=torch.bfloat16)
-    ref = _block_round_trip(t, "mxfp8", -1)
-    os.environ["HALO_LOWP_TRITON"] = "0"
-    try:
-        with _Spy() as s:
-            _assert_bits_equal(fake_quant(t, "mxfp8"), ref, "kill switch")
-            assert s.calls == 0, "kill switch ignored"
-    finally:
-        os.environ.pop("HALO_LOWP_TRITON", None)
-    print("  kill switch — OK")
-
-
 def test_ste_backward():
     """Straight-through: the gradient passes unchanged through the fast path."""
     t = torch.randn(64, K, device=DEV, dtype=torch.bfloat16, requires_grad=True)
@@ -130,7 +114,6 @@ def run(ctx) -> dict:
     checks: dict[str, bool] = {}
     record_check(checks, "bit_exact_against_eager", test_bit_exact_against_eager)
     record_check(checks, "routing", test_routing)
-    record_check(checks, "kill_switch", test_kill_switch)
     record_check(checks, "ste_backward", test_ste_backward)
     return {"checks": checks}
 
