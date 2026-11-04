@@ -13,6 +13,8 @@ import triton.language as tl
 from triton.language.extra import libdevice
 
 _TINY = torch.finfo(torch.float32).tiny  # 2^-126
+# Blocks per program: fastest on 4 of 5 weight and activation shapes in a 16–256 sweep on B300 (SM103)
+_BPP = 128
 
 
 @triton.jit
@@ -54,11 +56,11 @@ def _mxfp8_fake_quant_kernel(x_ptr, out_ptr, n_blocks, BPP: tl.constexpr, BLOCK:
     tl.store(out_ptr + offs, out.to(tl.bfloat16).to(out_ptr.dtype.element_ty), mask=mask)
 
 
-def fake_quant_mxfp8_triton(t: torch.Tensor, block_size: int, BPP: int = 64) -> torch.Tensor:
+def fake_quant_mxfp8_triton(t: torch.Tensor, block_size: int) -> torch.Tensor:
     """Last-axis, contiguous, CUDA. Caller guarantees ``t.shape[-1] % block_size == 0``."""
     if t.numel() == 0:
         return torch.empty_like(t)
     out = torch.empty_like(t)
     n_blocks = t.numel() // block_size
-    _mxfp8_fake_quant_kernel[(triton.cdiv(n_blocks, BPP),)](t, out, n_blocks, BPP=BPP, BLOCK=block_size, TINY=_TINY)
+    _mxfp8_fake_quant_kernel[(triton.cdiv(n_blocks, _BPP),)](t, out, n_blocks, BPP=_BPP, BLOCK=block_size, TINY=_TINY)
     return out
